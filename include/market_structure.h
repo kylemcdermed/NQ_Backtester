@@ -6,21 +6,37 @@
  *  CUSTOM MARKET STRUCTURE — context-aware labeling
  * ============================================================
  *
- *  TROUGH PATTERN — label decision:
- *    C2.low > lastHL  → HL  (trough above last confirmed HL)
- *    C2.low < lastHL  → LL  (broke below last HL = structure shift)
+ *  ROLLING 4-BAR WINDOW:
+ *    C1 = data[i-3]
+ *    C2 = data[i-2]   ← label placed here
+ *    C3 = data[i-1]
+ *    C4 = data[i]     ← validator bar, CONSUMED after pattern fires
  *
- *  PEAK PATTERN — label decision:
- *    C2.high < lastLH → LH  (peak below last confirmed LH)
- *    C2.high > lastLH → HH  (broke above last LH = structure shift)
+ *  CONSUMPTION RULE:
+ *    When a pattern fires (trough or peak), C4's bar index is recorded
+ *    as lastUsedC4_. Any subsequent window where C1, C2, or C3 would
+ *    overlap with that bar is skipped entirely. This prevents C4 of one
+ *    pattern from becoming part of the next pattern.
  *
- *  4-BAR WINDOW CONDITIONS (same for both):
- *    Trough: C1.low > C2.low  &&  C2.low < C3.low  &&  C4.low > C2.low
- *    Peak:   C1.high < C2.high  &&  C2.high > C3.high  &&  C4.high < C2.high
- *    C3 unrestricted in both directions.
+ *    Concretely: after a pattern fires at bar i (C4=i, C2=i-2),
+ *    the next valid window cannot start until C1 = i+1 at earliest,
+ *    meaning the next pattern can fire at i+3 earliest (C4=i+3).
  *
- *  Anchors initialized from bar 0.
- *  lastHL and lastLH update on every new HL/LH confirmed.
+ *  TROUGH PATTERN conditions:
+ *    C1.low > C2.low  &&  C2.low < C3.low  &&  C4.low > C2.low
+ *
+ *    Label:
+ *      C2.low > lastHL → HL, update lastHL
+ *      C2.low < lastHL → LL (structure shift), update lastHL + lastLL
+ *
+ *  PEAK PATTERN conditions:
+ *    C1.high < C2.high  &&  C2.high > C3.high  &&  C4.high < C2.high
+ *
+ *    Label:
+ *      C2.high < lastLH → LH, update lastLH
+ *      C2.high > lastLH → HH (structure shift), update lastLH + lastHH
+ *
+ *  C3 is unrestricted in both directions for both patterns.
  * ============================================================
  */
 
@@ -59,21 +75,32 @@ public:
         const Bar& c4  = data[i];
         int        c2Bar = i - 2;
 
+        // ── Consumption check ────────────────────────────────────────────────
+        // Skip this window if any of C1, C2, C3 overlaps with the last C4
+        // lastUsedC4_ is the bar index of the C4 that last confirmed a pattern
+        // C1=i-3, C2=i-2, C3=i-1 must all be > lastUsedC4_
+        if ((i - 3) <= lastUsedC4_ ||
+            (i - 2) <= lastUsedC4_ ||
+            (i - 1) <= lastUsedC4_)
+            return;
+
+        bool troughFired = false;
+        bool peakFired   = false;
+
         // ── TROUGH pattern ───────────────────────────────────────────────────
         if (c1.low  > c2.low  &&
             c2.low  < c3.low  &&
             c4.low  > c2.low)
         {
             if (c2.low > lastHL_) {
-                // Above last HL → new Higher Low
                 emit(StructureType::HL, c2.low, c2Bar);
-                lastHL_ = c2.low;
+                lastHL_     = c2.low;
+                troughFired = true;
             } else if (c2.low < lastHL_) {
-                // Below last HL → structure shift, Lower Low
                 emit(StructureType::LL, c2.low, c2Bar);
-                lastLL_ = c2.low;
-                // Reset lastHL down so future troughs compare correctly
-                lastHL_ = c2.low;
+                lastLL_     = c2.low;
+                lastHL_     = c2.low;   // reset HL anchor to new LL
+                troughFired = true;
             }
         }
 
@@ -83,16 +110,20 @@ public:
             c4.high < c2.high)
         {
             if (c2.high < lastLH_) {
-                // Below last LH → new Lower High
                 emit(StructureType::LH, c2.high, c2Bar);
-                lastLH_ = c2.high;
+                lastLH_   = c2.high;
+                peakFired = true;
             } else if (c2.high > lastLH_) {
-                // Above last LH → structure shift, Higher High
                 emit(StructureType::HH, c2.high, c2Bar);
-                lastHH_ = c2.high;
-                // Reset lastLH up so future peaks compare correctly
-                lastLH_ = c2.high;
+                lastHH_   = c2.high;
+                lastLH_   = c2.high;    // reset LH anchor to new HH
+                peakFired = true;
             }
+        }
+
+        // ── Record C4 consumption if any pattern fired ───────────────────────
+        if (troughFired || peakFired) {
+            lastUsedC4_ = i;  // C4 = current bar i is now consumed
         }
     }
 
@@ -102,10 +133,11 @@ public:
     double getLastLH() const { return lastLH_; }
 
 private:
-    double lastHH_ = 0.0;
-    double lastLH_ = 0.0;
-    double lastHL_ = 0.0;
-    double lastLL_ = 0.0;
+    double lastHH_     = 0.0;
+    double lastLH_     = 0.0;
+    double lastHL_     = 0.0;
+    double lastLL_     = 0.0;
+    int    lastUsedC4_ = -1;   // bar index of last consumed C4
 
     void emit(StructureType type, double price, int barIndex) {
         points.push_back({type, price, barIndex});
